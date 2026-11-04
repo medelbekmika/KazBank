@@ -80,7 +80,7 @@ FLASK_PORT=5000
 
 Replace `USERNAME` and `PASSWORD` with your PostgreSQL credentials.
 
-Do not commit `.env` to GitLab.
+Do not commit `.env` to the repository.
 
 ### Step 5. Create tables and insert seed data
 
@@ -223,37 +223,36 @@ All user-supplied SQL values are passed through Psycopg parameterized queries us
 
 ## 7. Database transactions and connection pooling
 
-- A single shared `ConnectionPool` is created when the Flask application starts.
-- Pool configuration: `min_size=2`, `max_size=8`.
-- Write operations explicitly commit successful transactions and roll back after exceptions.
-- Money transfers use PostgreSQL `SERIALIZABLE` isolation.
-- Serialization failures (`SQLSTATE 40001`) trigger retries, up to three attempts.
-- Both account rows are locked in ascending account ID order.
-- A transfer updates both balances and creates debit and credit transaction records in one database transaction.
-- A savepoint protects the transaction-log insertion step. If logging fails, the outer transaction rolls back the balance changes.
+- A single shared `ConnectionPool` is created when the Flask application starts (`min_size=2`, `max_size=8`, `timeout=5s`) and closed on shutdown.
+- Write operations commit explicitly on success and roll back on any exception.
+- `POST /transfer` runs in one `SERIALIZABLE` transaction (`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` as the first statement). The level applies to that transaction only, so it does not leak into other requests that reuse the pooled connection.
+- Serialization failures (`SQLSTATE 40001`, also at `COMMIT`) restart the whole transaction, up to three attempts with a short back-off; after that the API returns `409`.
+- Both account rows are locked with `SELECT ... FOR UPDATE ORDER BY account_id` (ascending order) to prevent deadlocks.
+- The debit step is wrapped in a `SAVEPOINT`: if the `CHECK (balance >= 0)` constraint fires, only that step is rolled back to the savepoint and reported as `400 Insufficient funds`.
+- A transfer updates both balances and writes the DEBIT and CREDIT rows in `transactions` in the same transaction: either everything is saved or nothing.
 
-## 8. Rubric checklist
+## 8. HTTP status codes
 
-| Requirement | Implementation / verification |
+| Situation | Status |
 |---|---|
-| R1 — Schema and seed script | Implemented and executed successfully |
-| R2 — Required API endpoints | Implemented and tested |
-| R3 — Shared connection pool | Implemented; `/health` confirms min=2 and max=8 |
-| R4 — Atomic transfer | Successful transfer and insufficient-funds case tested |
-| R5 — SERIALIZABLE and retry | Implemented; concurrency retry not independently stress-tested |
-| R6 — Database error handling | Handlers implemented; duplicate email tested; all database error classes not independently tested |
-| R7 — Parameterized SQL | Implemented; SQL injection input tested |
-| R8 — Health endpoint | Tested; returned HTTP 200 and pool statistics |
+| Success (GET / transfer) | 200 |
+| Customer created | 201 |
+| Invalid or missing input, insufficient funds, constraint violation | 400 |
+| Account not found / unknown route | 404 |
+| Duplicate email (`UniqueViolation`) or unresolved serialization conflict | 409 |
+| Database unavailable (`OperationalError`, pool timeout) | 503 |
 
-## 9. GitHub submission
+All responses, including 404/405/500, are JSON.
 
-Before submission:
+## 9. Rubric mapping
 
-- Include the project source files.
-- Include `README.md`, `requirements.txt`, and `.env.example`.
-- Do not include `.env` or `.venv/`.
-- Submit the project in the required directory: `python_project/<your_id>/`.
-
-## 10. Schema compatibility note
-
-The assignment refers to the KazBank schema from Week 4. The exact Week 4 schema should be compared with the tables and columns in `schema_seed.py` before final submission. If the instructor provided a specific DDL, use that schema and adjust the application queries if necessary.
+| Requirement | Where |
+|---|---|
+| R1 — Schema and seed from Python | `schema_seed.py` |
+| R2 — Five endpoints | `app/routes.py` |
+| R3 — Shared connection pool | `app/__init__.py` |
+| R4 — Atomic transfer | `transfer()` in `app/routes.py` |
+| R5 — SERIALIZABLE + retry | `run_serializable_with_retry()` |
+| R6 — Specific psycopg3 errors | error handlers in `app/__init__.py` |
+| R7 — Parameterised SQL | every query uses `%s` placeholders |
+| R8 — `/health` with pool stats | `health()` in `app/routes.py` |
