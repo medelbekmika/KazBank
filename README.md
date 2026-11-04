@@ -245,7 +245,7 @@ All user-supplied SQL values are passed through Psycopg parameterized queries us
 | R7 — Parameterized SQL | Implemented; SQL injection input tested |
 | R8 — Health endpoint | Tested; returned HTTP 200 and pool statistics |
 
-## 9. GitLab submission
+## 9. GitHub submission
 
 Before submission:
 
