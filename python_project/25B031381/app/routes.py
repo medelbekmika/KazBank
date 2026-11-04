@@ -1,11 +1,16 @@
 from decimal import Decimal, InvalidOperation
 import time
 
-import psycopg
-from psycopg import IsolationLevel, errors
+from psycopg import errors
 from psycopg.rows import dict_row
 from flask import current_app, jsonify, request
 
+class InsufficientFunds(Exception):
+    pass
+
+
+class AccountNotFound(Exception):
+    pass
 
 def get_pool():
     return current_app.extensions["db_pool"]
@@ -15,31 +20,78 @@ def json_error(message, status):
     return jsonify({"error": message}), status
 
 
-def parse_positive_amount(value):
+def parse_account_id(data, field):
+    """Strict positive integer: rejects missing, bool, float, '1.5', 'abc'."""
+    if field not in data:
+        raise ValueError(f"{field} is required")
+
+    value = data[field]
+
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        result = int(value.strip())
+    else:
+        raise ValueError(f"{field} must be an integer")
+
+    if result <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return result
+
+
+def parse_positive_amount(data, field="amount"):
+    if field not in data:
+        raise ValueError(f"{field} is required")
+
+    value = data[field]
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{field} must be a valid number")
+
     try:
-        amount = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        raise ValueError("amount must be a valid number")
+        amount = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"{field} must be a valid number")
 
     if not amount.is_finite() or amount <= 0:
-        raise ValueError("amount must be greater than zero")
+        raise ValueError(f"{field} must be greater than zero")
 
     if amount.as_tuple().exponent < -2:
-        raise ValueError("amount may have at most 2 decimal places")
+        raise ValueError(f"{field} may have at most 2 decimal places")
+
+    if amount >= Decimal("1e13"):  # NUMERIC(15,2) holds at most 13 integer digits
+        raise ValueError(f"{field} is too large")
 
     return amount
 
 
+def optional_text(data, field):
+    """Return stripped str, or None if absent/null/blank. Non-str -> ValueError."""
+    value = data.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    value = value.strip()
+    return value or None
+
+
 def run_serializable_with_retry(operation, max_retries=3):
-    """Retry the complete transaction after PostgreSQL SQLSTATE 40001."""
+    """Run `operation(conn)` in one SERIALIZABLE transaction.
+
+    The whole transaction is retried on SQLSTATE 40001 (SerializationFailure).
+    The isolation level is set with SET TRANSACTION, so it applies to this
+    transaction only and never leaks into the pooled connection.
+    """
     for attempt in range(max_retries):
         try:
             with get_pool().connection() as conn:
-                conn.isolation_level = IsolationLevel.SERIALIZABLE
-
                 try:
+                    # Must be the first statement of the transaction.
+                    conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
                     result = operation(conn)
-                    conn.commit()
+                    conn.commit()  # 40001 can also be raised here
                     return result
                 except Exception:
                     conn.rollback()
@@ -51,7 +103,6 @@ def run_serializable_with_retry(operation, max_retries=3):
             time.sleep(0.05 * (attempt + 1))
 
     raise RuntimeError("Maximum serialization retries exceeded")
-
 
 def register_routes(app):
 
@@ -82,8 +133,18 @@ def register_routes(app):
     def create_customer():
         data = request.get_json(silent=True)
 
-        if not isinstance(data, dict) or not data.get("full_name"):
-            return json_error("full_name is required", 400)
+        if not isinstance(data, dict):
+            return json_error("JSON object body is required", 400)
+
+        full_name = data.get("full_name")
+        if not isinstance(full_name, str) or not full_name.strip():
+            return json_error("full_name is required and must be a non-empty string", 400)
+
+        try:
+            city = optional_text(data, "city") or "Almaty"
+            email = optional_text(data, "email")
+        except ValueError as exc:
+            return json_error(str(exc), 400)
 
         with get_pool().connection() as conn:
             try:
@@ -93,11 +154,7 @@ def register_routes(app):
                            (full_name, city, email)
                            VALUES (%s, %s, %s)
                            RETURNING customer_id, full_name, city, email""",
-                        (
-                            data["full_name"],
-                            data.get("city", "Almaty"),
-                            data.get("email"),
-                        ),
+                        (full_name.strip(), city, email),
                     ).fetchone()
 
                 conn.commit()
@@ -135,24 +192,20 @@ def register_routes(app):
         data = request.get_json(silent=True)
 
         if not isinstance(data, dict):
-            return json_error("JSON body is required", 400)
+            return json_error("JSON object body is required", 400)
 
         try:
-            from_account = int(data["from_account_id"])
-            to_account = int(data["to_account_id"])
-            amount = parse_positive_amount(data["amount"])
-
-        except (KeyError, TypeError, ValueError) as exc:
-            return json_error(str(exc) or "Invalid transfer input", 400)
+            from_account = parse_account_id(data, "from_account_id")
+            to_account = parse_account_id(data, "to_account_id")
+            amount = parse_positive_amount(data)
+        except ValueError as exc:
+            return json_error(str(exc), 400)
 
         if from_account == to_account:
-            return json_error(
-                "Source and destination accounts must be different",
-                400,
-            )
+            return json_error("Source and destination accounts must be different", 400)
 
         def transaction(conn):
-            # Lock both rows in a consistent order to reduce deadlock risk.
+            # Lock both rows in ascending account_id order (deadlock prevention).
             account_ids = sorted([from_account, to_account])
 
             with conn.cursor(row_factory=dict_row) as cur:
@@ -166,22 +219,28 @@ def register_routes(app):
                 ).fetchall()
 
             if len(locked) != 2:
-                raise LookupError("One or both accounts do not exist")
+                raise AccountNotFound("One or both accounts do not exist")
 
-            balances = {
-                row["account_id"]: row["balance"]
-                for row in locked
-            }
+            balances = {row["account_id"]: row["balance"] for row in locked}
 
             if balances[from_account] < amount:
-                raise ArithmeticError("Insufficient funds")
+                raise InsufficientFunds("Insufficient funds")
 
-            conn.execute(
-                """UPDATE accounts
-                   SET balance = balance - %s
-                   WHERE account_id = %s""",
-                (amount, from_account),
-            )
+            # SAVEPOINT around the debit step: if the CHECK (balance >= 0)
+            # constraint fires, only this step is rolled back to the savepoint
+            # and reported as "insufficient funds".
+            conn.execute("SAVEPOINT debit_step")
+            try:
+                conn.execute(
+                    """UPDATE accounts
+                       SET balance = balance - %s
+                       WHERE account_id = %s""",
+                    (amount, from_account),
+                )
+            except errors.CheckViolation:
+                conn.execute("ROLLBACK TO SAVEPOINT debit_step")
+                raise InsufficientFunds("Insufficient funds")
+            conn.execute("RELEASE SAVEPOINT debit_step")
 
             conn.execute(
                 """UPDATE accounts
@@ -190,30 +249,20 @@ def register_routes(app):
                 (amount, to_account),
             )
 
-            # Both transaction records belong to the same atomic transfer.
-            conn.execute("SAVEPOINT transfer_log")
-
-            try:
-                conn.execute(
-                    """INSERT INTO transactions
-                       (account_id, amount, tx_type, related_account_id)
-                       VALUES (%s, %s, 'DEBIT', %s)""",
-                    (from_account, amount, to_account),
-                )
-
-                conn.execute(
-                    """INSERT INTO transactions
-                       (account_id, amount, tx_type, related_account_id)
-                       VALUES (%s, %s, 'CREDIT', %s)""",
-                    (to_account, amount, from_account),
-                )
-
-                conn.execute("RELEASE SAVEPOINT transfer_log")
-
-            except Exception:
-                conn.execute("ROLLBACK TO SAVEPOINT transfer_log")
-                conn.execute("RELEASE SAVEPOINT transfer_log")
-                raise
+            # Both log rows belong to the same atomic transfer: any failure
+            # here rolls back the whole transaction (balances included).
+            conn.execute(
+                """INSERT INTO transactions
+                   (account_id, amount, tx_type, related_account_id)
+                   VALUES (%s, %s, 'DEBIT', %s)""",
+                (from_account, amount, to_account),
+            )
+            conn.execute(
+                """INSERT INTO transactions
+                   (account_id, amount, tx_type, related_account_id)
+                   VALUES (%s, %s, 'CREDIT', %s)""",
+                (to_account, amount, from_account),
+            )
 
             return {
                 "status": "success",
@@ -226,10 +275,10 @@ def register_routes(app):
             result = run_serializable_with_retry(transaction)
             return jsonify(result), 200
 
-        except LookupError as exc:
+        except AccountNotFound as exc:
             return json_error(str(exc), 404)
 
-        except ArithmeticError as exc:
+        except InsufficientFunds as exc:
             return json_error(str(exc), 400)
 
         except errors.SerializationFailure:
