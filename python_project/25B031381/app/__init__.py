@@ -1,9 +1,13 @@
-from flask import Flask, jsonify
-from dotenv import load_dotenv
-from psycopg_pool import ConnectionPool
-from psycopg import errors
+import atexit
 import os
+
 import psycopg
+from dotenv import load_dotenv
+from flask import Flask, jsonify
+from psycopg import errors
+from psycopg_pool import ConnectionPool, PoolTimeout
+from werkzeug.exceptions import HTTPException
+
 
 def create_app():
     load_dotenv()
@@ -22,29 +26,41 @@ def create_app():
         open=True,
     )
     app.extensions["db_pool"] = pool
+    atexit.register(pool.close)  # close connections cleanly on shutdown
 
     from app.routes import register_routes
     register_routes(app)
 
+    # ---- Database errors -------------------------------------------------
     @app.errorhandler(errors.UniqueViolation)
     def handle_unique_violation(exc):
         return jsonify({"error": "Conflict", "detail": "A value that must be unique already exists."}), 409
 
     @app.errorhandler(errors.NotNullViolation)
     def handle_not_null_violation(exc):
-        return jsonify({"error": "Bad Request", "detail": "A required database field is missing."}), 400
+        column = getattr(exc.diag, "column_name", None)
+        detail = f"Missing required field: {column}" if column else "A required database field is missing."
+        return jsonify({"error": "Bad Request", "detail": detail}), 400
+
+    @app.errorhandler(errors.ForeignKeyViolation)
+    @app.errorhandler(errors.CheckViolation)
+    def handle_constraint_violation(exc):
+        return jsonify({"error": "Bad Request", "detail": "Request violates a database constraint."}), 400
 
     @app.errorhandler(psycopg.OperationalError)
+    @app.errorhandler(PoolTimeout)
     def handle_operational_error(exc):
-        app.logger.exception("Database operational error")
+        app.logger.exception("Database unavailable")
         return jsonify({"error": "Service Unavailable", "detail": "Database unavailable."}), 503
 
-    @app.errorhandler(404)
-    def handle_not_found(exc):
-        return jsonify({"error": "Not Found", "detail": "The requested resource does not exist."}), 404
+    # ---- Everything else is JSON too (404, 405, 500, ...) ------------------
+    @app.errorhandler(HTTPException)
+    def handle_http_exception(exc):
+        return jsonify({"error": exc.name, "detail": exc.description}), exc.code
 
-    @app.errorhandler(400)
-    def handle_bad_request(exc):
-        return jsonify({"error": "Bad Request", "detail": "Invalid request."}), 400
+    @app.errorhandler(Exception)
+    def handle_unexpected(exc):
+        app.logger.exception("Unhandled error")
+        return jsonify({"error": "Internal Server Error", "detail": "Unexpected server error."}), 500
 
     return app
